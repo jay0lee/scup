@@ -1,6 +1,5 @@
 # -*- mode: python -*-
 a = Analysis(['scup.py'],
-             pathex=['C:\\scup\\'],
              hiddenimports=[],
              hookspath=None,
              excludes=['_tkinter'],
