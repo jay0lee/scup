@@ -12,6 +12,8 @@ import sqlite3
 from urllib.parse import urlparse
 from email import message_from_bytes
 
+CLIENT_DROPPED_EXCEPTIONS = (BrokenPipeError, ConnectionResetError, TimeoutError)
+
 def readConfigAndDefaults():
   in_config = configparser.ConfigParser()
   in_config.read('scup.cfg')
@@ -46,10 +48,10 @@ def send_proxy_pac(self):
   self.send_header('Content-type', 'application/x-ns-proxy-autoconfig')
   self.end_headers()
   self.wfile.write(bytes('''function FindProxyForURL(url, host) {
-  if (shExpMatch(url, "http://%s/*"))
+  if (shExpMatch(url, "http://%s/chromeos/*"))
     return "PROXY %s:%s";
   return "DIRECT";
-}''' % (config['remote_host'], config['proxy_ip'], config['proxy_port'], 'utf-8')))
+}''' % (config['remote_host'], config['proxy_ip'], config['proxy_port']), 'utf-8'))
 
 def send_stats(self):
   self.send_response(200)
@@ -93,7 +95,7 @@ def getPathCacheStatus(path, cache_filename, sqlconn, sqlcur):
     if os.path.exists(cache_filename):
       if local_status == 'PARTIAL':
         status = 'PARTIAL'
-      elif local_status == 'CACHED' and os.path.getsize(requested_file) == content_length:
+      elif local_status == 'CACHED' and os.path.getsize(cache_filename) == content_length:
         status = 'CACHED'
   return status
 
@@ -127,7 +129,7 @@ class CacheHandler(BaseHTTPRequestHandler):
       remote_url = '%s://%s%s' % (config['remote_protocol'], config['remote_host'], request_path)
       h = requests.head(remote_url)
       if h.status_code < 200 or h.status_code > 299:
-        print('%s - %s: %s' % (self.client_ip, h.status_code, h.reason))
+        print('%s - %s: %s' % (self.client_address[0], h.status_code, h.reason))
         self.send_error(h.status_code, h.reason)
         return
       print("Cache miss for %s" % (request_path))
@@ -161,7 +163,7 @@ class CacheHandler(BaseHTTPRequestHandler):
             if send_to_client:
               try:
                 self.wfile.write(chunk)
-              except (ConnectionResetError, TimeoutError):
+              except CLIENT_DROPPED_EXCEPTIONS:
                 print('client seems to have hungup. Still trying to finish file download')
                 send_to_client = False
               bytes_sent_to_client += len(chunk)
@@ -186,7 +188,7 @@ class CacheHandler(BaseHTTPRequestHandler):
                 break
               try:
                 self.wfile.write(chunk)
-              except (ConnectionResetError, TimeoutError):
+              except CLIENT_DROPPED_EXCEPTIONS:
                 print('client seems to have hungup. Maybe we\'ll catch them on the flip side...')
                 return
               bytes_sent_to_client += len(chunk)
@@ -195,13 +197,7 @@ class CacheHandler(BaseHTTPRequestHandler):
             sleep(1)
     else:
       print("Cache hit from %s" % (cache_filename))
-      headers_b = open('%s.headers' % cache_filename, 'rb').read()
-      headers = message_from_bytes(headers_b)
       self.send_response(success_code)
-      for header, value in headers.items():
-        if header in ['Date', 'Server']:
-          continue
-        self.send_header(keyword=header, value=value)
       self.end_headers()
       with open(cache_filename, mode='rb') as f:
         f.seek(start_byte)
@@ -211,7 +207,7 @@ class CacheHandler(BaseHTTPRequestHandler):
             break
           try:
             self.wfile.write(chunk)
-          except (ConnectionResetError, TimeoutError):
+          except CLIENT_DROPPED_EXCEPTIONS:
             print('client seems to have hungup. Maybe we\'ll catch them on the flip side...')
             return
           bytes_sent_to_client += len(chunk)
@@ -219,12 +215,18 @@ class CacheHandler(BaseHTTPRequestHandler):
 def run():
   global config, sqldbfile
   config = readConfigAndDefaults()
+  if not os.path.exists(config['cache_path']):
+    os.mkdir(config['cache_path'])
   print('Cache path: %s' % config['cache_path'])
   sqldbfile = os.path.join(config['cache_path'], 'cache.sqlite')
   if not os.path.isfile(sqldbfile):
     sqlconn, sqlcur = getSqlConnAndCur()
     initializeDB(sqlconn, sqlcur)
-  server = ThreadingSimpleServer((config['proxy_ip'], config['proxy_port']), CacheHandler)
+  try:
+    server = ThreadingSimpleServer((config['proxy_ip'], config['proxy_port']), CacheHandler)
+  except OSError as e:
+    print('Error: %s' % e)
+    return
   print('started proxy server at %s:%s' % (config['proxy_ip'], config['proxy_port']))
   try:
     while True:
