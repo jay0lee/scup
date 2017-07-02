@@ -12,7 +12,7 @@ import sqlite3
 from urllib.parse import urlparse
 from email import message_from_bytes
 
-CLIENT_DROPPED_EXCEPTIONS = (BrokenPipeError, ConnectionResetError, TimeoutError)
+CLIENT_DROPPED_EXCEPTIONS = (BrokenPipeError, ConnectionResetError, TimeoutError, ConnectionAbortedError)
 
 def readConfigAndDefaults():
   in_config = configparser.ConfigParser()
@@ -62,16 +62,15 @@ def send_stats(self):
 def initializeDB(sqlconn, sqlcur):
   print('Initializing %s' % sqldbfile)
   sqlcur.executescript('''
-    CREATE TABLE files(remote_path TEXT UNIQUE,
-                         local_file TEXT,
+    CREATE TABLE files(remote_path TEXT UNIQUE PRIMARY KEY,
                          etag TEXT,
                          local_status TEXT,
                          first_seen TIMESTAMP,
                          last_seen TIMESTAMP,
                          content_length INTEGER,
-                         downloaded_length INTEGER,
                          content_type TEXT);
-    CREATE TABLE downloads(client_ip TEXT,
+    CREATE TABLE downloads(id INTEGER PRIMARY KEY AUTOINCREMENT,
+                           client_ip TEXT,
                            file_id TEXT,
                            bytes_read INTEGER,
                            start_time TIMESTAMP,
@@ -151,8 +150,11 @@ class CacheHandler(BaseHTTPRequestHandler):
       etag = headers.get('Etag', '')
       content_length = headers.get('Content-length', 0)
       content_type = headers.get('Content-type', 'application/octet-stream')
-      sqlcur.execute('''INSERT into files (remote_path, etag, local_status, first_seen, last_seen, content_length, content_type) VALUES
+      sqlcur.execute('''INSERT INTO files (remote_path, etag, local_status, first_seen, last_seen, content_length, content_type) VALUES
         (?, ?, 'PARTIAL', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, ?)''', (request_path, etag, content_length, content_type))
+      sqlcur.execute('''INSERT INTO downloads (id, client_ip, file_id, bytes_read, start_time, end_time) VALUES (NULL, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)''',
+        (self.client_address[0], request_path))
+      download_id = sqlcur.lastrowid
       sqlconn.commit()
       send_to_client = True
       with open(cache_filename, 'wb') as f:
@@ -166,7 +168,10 @@ class CacheHandler(BaseHTTPRequestHandler):
               except CLIENT_DROPPED_EXCEPTIONS:
                 print('client seems to have hungup. Still trying to finish file download')
                 send_to_client = False
+                continue
               bytes_sent_to_client += len(chunk)
+              sqlcur.execute('''UPDATE downloads SET bytes_read = ?, end_time = CURRENT_TIMESTAMP WHERE id = ?''', (bytes_sent_to_client, download_id))
+              sqlconn.commit()
       sqlcur.execute('''UPDATE files SET local_status = 'CACHED', last_seen = CURRENT_TIMESTAMP where remote_path = ?''', (request_path,))
       sqlconn.commit()
       return
@@ -175,10 +180,13 @@ class CacheHandler(BaseHTTPRequestHandler):
       self.send_response(success_code)
       self.end_headers()
       next_chunk_start = start_byte
-      sqlcur.execute('''SELECT content_length FROM files WHERE remote_path = ?''', (request_path,))[0][0]
+      sqlcur.execute('''SELECT content_length FROM files WHERE remote_path = ?''', (request_path,))
       full_file_size = sqlcur.fetchall()[0][0]
-      while True:
+      have_full_file = False
+      while not have_full_file:
         current_size = os.path.getsize(cache_filename)
+        if current_size == full_file_size:
+          have_full_file = True
         with open(cache_filename, mode='rb') as f:
           if current_size >= next_chunk_start + config['chunk_size']:
             while True:
@@ -194,7 +202,7 @@ class CacheHandler(BaseHTTPRequestHandler):
               bytes_sent_to_client += len(chunk)
               next_chunk_start += config['chunk_size']
           else:
-            sleep(1)
+            time.sleep(1)
     else:
       print("Cache hit from %s" % (cache_filename))
       self.send_response(success_code)
