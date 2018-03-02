@@ -1,18 +1,19 @@
 from http.server import BaseHTTPRequestHandler, HTTPServer
-import configparser
 import os
 import re
-import requests
 import sys
 import time
-from urllib.error import HTTPError
-from urllib.request import urlretrieve, url2pathname, Request, urlopen
 from socketserver import ThreadingMixIn
 import sqlite3
+from urllib.error import HTTPError
 from urllib.parse import urlparse
-from email import message_from_bytes
+from urllib.request import urlretrieve, url2pathname, Request, urlopen
+import errno
 
-CLIENT_DROPPED_EXCEPTIONS = (BrokenPipeError, ConnectionResetError, TimeoutError, ConnectionAbortedError)
+import configparser
+import requests
+
+CLIENT_DROPPED_EXCEPTIONS = (ConnectionResetError, TimeoutError, ConnectionAbortedError, BrokenPipeError)
 
 def readConfigAndDefaults():
   in_config = configparser.ConfigParser()
@@ -50,10 +51,12 @@ def send_proxy_pac(self):
   self.wfile.write(bytes('''function FindProxyForURL(url, host) {
   if (shExpMatch(url, "http://%s/chromeos/*"))
     return "PROXY %s:%s";
+  if (shExpMatch(url, "http://%s/release2/chrome/*"))
+    return "PROXY %s:%s";
   return "DIRECT";
-}''' % (config['remote_host'], config['proxy_ip'], config['proxy_port']), 'utf-8'))
+}''' % (config['remote_host'], config['proxy_ip'], config['proxy_port'], config['remote_host'], config['proxy_ip'], config['proxy_port']), 'utf-8'))
 
-def send_stats(self):
+def send_stats(self, sqlconn, sqlcur):
   self.send_response(200)
   self.send_header('Content-type', 'text/html')
   self.end_headers()
@@ -101,9 +104,18 @@ def getPathCacheStatus(path, cache_filename, sqlconn, sqlcur):
 class ThreadingSimpleServer(ThreadingMixIn, HTTPServer):
   pass
 
+def loop_sql_cmd(sqlcur, sqlconn, sqlstring, sqltup):
+  while True: # keep trying to get a lock
+    try:
+      sqlcur.execute(sqlstring, sqltup)
+      sqlconn.commit()
+      break
+    except sqlite3.OperationalError:
+      continue
+
 class CacheHandler(BaseHTTPRequestHandler):
   def do_GET(self):
-    request_path = urlparse(self.path).path
+    request_path = str(urlparse(self.path).path)
     if request_path == '/proxy.pac':
       send_proxy_pac(self)
       return
@@ -150,37 +162,37 @@ class CacheHandler(BaseHTTPRequestHandler):
       etag = headers.get('Etag', '')
       content_length = headers.get('Content-length', 0)
       content_type = headers.get('Content-type', 'application/octet-stream')
-      sqlcur.execute('''INSERT INTO files (remote_path, etag, local_status, first_seen, last_seen, content_length, content_type) VALUES
-        (?, ?, 'PARTIAL', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, ?)''', (request_path, etag, content_length, content_type))
-      sqlcur.execute('''INSERT INTO downloads (id, client_ip, file_id, bytes_read, start_time, end_time) VALUES (NULL, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)''',
-        (self.client_address[0], request_path))
-      download_id = sqlcur.lastrowid
-      sqlconn.commit()
-      send_to_client = True
-      with open(cache_filename, 'wb') as f:
-        for chunk in r.iter_content(chunk_size=config['chunk_size']):
-          if chunk: # skip keep-alive
-            bytes_from_server += len(chunk)
-            f.write(chunk)
-            if send_to_client:
-              try:
-                self.wfile.write(chunk)
-              except CLIENT_DROPPED_EXCEPTIONS:
-                print('client seems to have hungup. Still trying to finish file download')
-                send_to_client = False
-                continue
-              bytes_sent_to_client += len(chunk)
-              sqlcur.execute('''UPDATE downloads SET bytes_read = ?, end_time = CURRENT_TIMESTAMP WHERE id = ?''', (bytes_sent_to_client, download_id))
-              sqlconn.commit()
-      sqlcur.execute('''UPDATE files SET local_status = 'CACHED', last_seen = CURRENT_TIMESTAMP where remote_path = ?''', (request_path,))
-      sqlconn.commit()
-      return
-    elif cache_status == 'PARTIAL':
+      try:
+        loop_sql_cmd(sqlcur, sqlconn, '''INSERT INTO files (remote_path, etag, local_status, first_seen, last_seen, content_length, content_type) VALUES
+              (?, ?, 'PARTIAL', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, ?)''', (request_path, etag, content_length, content_type))
+        loop_sql_cmd(sqlcur, sqlconn, '''INSERT INTO downloads (id, client_ip, file_id, bytes_read, start_time, end_time) VALUES (NULL, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)''',
+          (self.client_address[0], request_path))
+        download_id = sqlcur.lastrowid
+        send_to_client = True
+        with open(cache_filename, 'wb') as f:
+          for chunk in r.iter_content(chunk_size=config['chunk_size']):
+            if chunk: # skip keep-alive
+              bytes_from_server += len(chunk)
+              f.write(chunk)
+              if send_to_client:
+                try:
+                  self.wfile.write(chunk)
+                except CLIENT_DROPPED_EXCEPTIONS:
+                  print('client seems to have hungup. Still trying to finish file download')
+                  send_to_client = False
+                  continue
+                bytes_sent_to_client += len(chunk)
+                loop_sql_cmd(sqlcur, sqlconn, '''UPDATE downloads SET bytes_read = ?, end_time = CURRENT_TIMESTAMP WHERE id = ?''', (bytes_sent_to_client, download_id))
+        loop_sql_cmd(sqlcur, sqlconn, '''UPDATE files SET local_status = 'CACHED', last_seen = CURRENT_TIMESTAMP where remote_path = ?''', (request_path,))
+        return
+      except sqlite3.IntegrityError:
+        cache_status = 'PARTIAL' # someone got to db first, we should act as partial
+    if cache_status == 'PARTIAL':
       print("Partial cache hit for %s" % (request_path))
       self.send_response(success_code)
       self.end_headers()
       next_chunk_start = start_byte
-      sqlcur.execute('''SELECT content_length FROM files WHERE remote_path = ?''', (request_path,))
+      loop_sql_cmd(sqlcur, sqlconn, '''SELECT content_length FROM files WHERE remote_path = ?''', (request_path,))
       full_file_size = sqlcur.fetchall()[0][0]
       have_full_file = False
       while not have_full_file:
@@ -223,6 +235,9 @@ class CacheHandler(BaseHTTPRequestHandler):
 def run():
   global config, sqldbfile
   config = readConfigAndDefaults()
+  if not config:
+    print('Error: no scup.cfg')
+    return 3
   if not os.path.exists(config['cache_path']):
     os.mkdir(config['cache_path'])
   print('Cache path: %s' % config['cache_path'])
